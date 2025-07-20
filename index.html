@@ -18,7 +18,7 @@
     }
 
     .container {
-      max-width: 800px;
+      max-width: 900px;
       margin: auto;
       background: #fff;
       border: 1px solid #ddd;
@@ -102,6 +102,16 @@
           <option value="python" selected>Python random</option>
           <option value="cpp">C++ mt19937</option>
           <option value="c">C rand()</option>
+          <option value="gnu">GNU random()</option>
+        </select>
+      </label>
+      <label id="gnuTypeLabel" style="display:none">
+        GNU RNG Type:
+        <select id="gnuType">
+          <option value="1">TYPE_1 (x^7 + x^3 + 1)</option>
+          <option value="2">TYPE_2 (x^15 + x + 1)</option>
+          <option value="3" selected>TYPE_3 (x^31 + x^3 + 1)</option>
+          <option value="4">TYPE_4 (x^63 + x + 1)</option>
         </select>
       </label>
     </div>
@@ -132,6 +142,11 @@
   </div>
 
   <script>
+    document.getElementById('rngType').addEventListener('change', () => {
+      document.getElementById('gnuTypeLabel').style.display =
+        document.getElementById('rngType').value === 'gnu' ? 'block' : 'none';
+    });
+
     let pyodideReady = false;
     let pyodide;
     async function initPyodide() {
@@ -140,32 +155,41 @@
     }
     initPyodide();
 
-    class MersenneTwister {
-      constructor(seed) {
-        this.mt = new Array(624);
-        this.index = 624;
-        this.mt[0] = seed >>> 0;
-        for (let i = 1; i < 624; i++) {
-          const s = this.mt[i-1] ^ (this.mt[i-1] >>> 30);
-          this.mt[i] = (((((s & 0xffff0000) >>> 16) * 1812433253) << 16) + ((s & 0x0000ffff) * 1812433253) + i) >>> 0;
+    class GNU_RNG {
+      constructor(seed, type) {
+        const config = {
+          1: { deg: 7, sep: 3 },
+          2: { deg: 15, sep: 1 },
+          3: { deg: 31, sep: 3 },
+          4: { deg: 63, sep: 1 },
+        }[type];
+        if (!config) throw new Error("Invalid GNU type");
+        this.deg = config.deg;
+        this.sep = config.sep;
+        this.state = new Array(this.deg);
+        this.fptr = this.sep;
+        this.rptr = 0;
+        this.end = this.deg;
+
+        // Seed using LCG
+        let word = seed || 1;
+        this.state[0] = word;
+        for (let i = 1; i < this.deg; i++) {
+          let hi = Math.floor(word / 127773);
+          let lo = word % 127773;
+          word = 16807 * lo - 2836 * hi;
+          if (word < 0) word += 2147483647;
+          this.state[i] = word;
         }
+        for (let i = 0; i < this.deg * 10; i++) this.next();
       }
-      twist() {
-        for (let i = 0; i < 624; i++) {
-          const y = (this.mt[i] & 0x80000000) + (this.mt[(i+1)%624] & 0x7fffffff);
-          this.mt[i] = this.mt[(i+397)%624] ^ (y >>> 1);
-          if (y & 1) this.mt[i] ^= 0x9908b0df;
-        }
-        this.index = 0;
-      }
-      genrand_int32() {
-        if (this.index >= 624) this.twist();
-        let y = this.mt[this.index++];
-        y ^= y >>> 11;
-        y ^= (y << 7) & 0x9d2c5680;
-        y ^= (y << 15) & 0xefc60000;
-        y ^= y >>> 18;
-        return y >>> 0;
+
+      next() {
+        this.state[this.fptr] = (this.state[this.fptr] + this.state[this.rptr]) >>> 0;
+        const result = this.state[this.fptr] >>> 1;
+        this.fptr = (this.fptr + 1) % this.end;
+        this.rptr = (this.rptr + 1) % this.end;
+        return result;
       }
     }
 
@@ -183,18 +207,10 @@
     }
 
     function processSeed(seedStr, seedType) {
-      if (seedType === 'int') {
-        const n = parseInt(seedStr, 10);
-        if (isNaN(n)) throw 'Invalid integer seed';
-        return n;
-      }
-      if (seedType === 'float') {
-        const f = parseFloat(seedStr);
-        if (isNaN(f)) throw 'Invalid float seed';
-        return Math.floor(f);
-      }
+      if (seedType === 'int') return parseInt(seedStr, 10) || 0;
+      if (seedType === 'float') return Math.floor(parseFloat(seedStr) || 0);
       let hash = 0;
-      for (const ch of seedStr) hash = ((hash << 5) - hash) + ch.charCodeAt(0) | 0;
+      for (const ch of seedStr) hash = ((hash << 5) - hash + ch.charCodeAt(0)) | 0;
       return hash >>> 0;
     }
 
@@ -211,33 +227,22 @@
         if (isNaN(lower) || isNaN(upper) || lower > upper) throw 'Invalid bounds';
         count = Math.min(Math.max(count, 1), 200);
 
-        let results;
+        let results = [];
         if (rngType === 'python') {
           if (!pyodideReady) { alert('Python engine loading, please wait...'); return; }
-          const code = `
-import random
-random.seed(${seed})
-results = [random.randint(${lower}, ${upper}) for _ in range(${count})]
-`;
+          const code = `import random\nrandom.seed(${seed})\nresults = [random.randint(${lower}, ${upper}) for _ in range(${count})]`;
           await pyodide.runPythonAsync(code);
-          const pyResults = pyodide.globals.get('results').toJs();
-          results = pyResults;
+          results = pyodide.globals.get('results').toJs();
         } else if (rngType === 'cpp') {
-          if (!Number.isInteger(seed)) throw 'C++ RNG requires integer seed';
           const mt = new MersenneTwister(seed);
-          results = [];
-          for (let i = 0; i < count; i++) {
-            const r = mt.genrand_int32() % (upper - lower + 1) + lower;
-            results.push(r);
-          }
-        } else {
-          if (!Number.isInteger(seed)) throw 'C rand() requires integer seed';
+          for (let i = 0; i < count; i++) results.push(mt.genrand_int32() % (upper - lower + 1) + lower);
+        } else if (rngType === 'c') {
           const lcg = new LCG(seed);
-          results = [];
-          for (let i = 0; i < count; i++) {
-            const r = Math.floor(lcg.random() * (upper - lower + 1)) + lower;
-            results.push(r);
-          }
+          for (let i = 0; i < count; i++) results.push(Math.floor(lcg.random() * (upper - lower + 1)) + lower);
+        } else if (rngType === 'gnu') {
+          const type = parseInt(document.getElementById('gnuType').value);
+          const gnu = new GNU_RNG(seed, type);
+          for (let i = 0; i < count; i++) results.push(gnu.next() % (upper - lower + 1) + lower);
         }
 
         document.getElementById('output').value = results.join(', ');
@@ -245,6 +250,35 @@ results = [random.randint(${lower}, ${upper}) for _ in range(${count})]
         alert(err);
       }
     });
+
+    class MersenneTwister {
+      constructor(seed) {
+        this.mt = new Array(624);
+        this.index = 624;
+        this.mt[0] = seed >>> 0;
+        for (let i = 1; i < 624; i++) {
+          const s = this.mt[i - 1] ^ (this.mt[i - 1] >>> 30);
+          this.mt[i] = (((((s & 0xffff0000) >>> 16) * 1812433253) << 16) + ((s & 0x0000ffff) * 1812433253) + i) >>> 0;
+        }
+      }
+      twist() {
+        for (let i = 0; i < 624; i++) {
+          const y = (this.mt[i] & 0x80000000) + (this.mt[(i + 1) % 624] & 0x7fffffff);
+          this.mt[i] = this.mt[(i + 397) % 624] ^ (y >>> 1);
+          if (y & 1) this.mt[i] ^= 0x9908b0df;
+        }
+        this.index = 0;
+      }
+      genrand_int32() {
+        if (this.index >= 624) this.twist();
+        let y = this.mt[this.index++];
+        y ^= y >>> 11;
+        y ^= (y << 7) & 0x9d2c5680;
+        y ^= (y << 15) & 0xefc60000;
+        y ^= y >>> 18;
+        return y >>> 0;
+      }
+    }
   </script>
 </body>
 </html>
